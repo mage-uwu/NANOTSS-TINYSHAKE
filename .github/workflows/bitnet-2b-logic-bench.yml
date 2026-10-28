@@ -1,0 +1,101 @@
+name: BitNet 2B Logic A-B
+
+on:
+  push:
+    branches: [bitnet-2b-llf-bench]
+    paths:
+      - "bitnet2b/**"
+      - ".github/workflows/bitnet-2b-logic-bench.yml"
+  workflow_dispatch:
+
+jobs:
+  bench:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      HF_HUB_ENABLE_HF_TRANSFER: "1"
+      MODEL_REV: a1f2f1c765812aa8af3f6eda4a313707064bba15
+      MODEL_DIR: ${{ github.workspace }}/BitNet/models/BitNet-b1.58-2B-4T
+      MODEL_FILE: ${{ github.workspace }}/BitNet/models/BitNet-b1.58-2B-4T/ggml-model-i2_s.gguf
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Machine
+        run: |
+          uname -a
+          lscpu
+          free -h
+          df -h
+
+      - name: Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build clang-18 python3-pip git git-lfs
+          python3 -m pip install --upgrade --break-system-packages huggingface_hub hf_transfer numpy
+
+      - name: Clone official BitNet
+        run: |
+          git clone --recursive https://github.com/microsoft/BitNet.git
+          cd BitNet
+          git rev-parse HEAD
+          git submodule status
+
+      - name: Download exact Microsoft 2B GGUF
+        run: |
+          mkdir -p "$MODEL_DIR"
+          hf download microsoft/bitnet-b1.58-2B-4T-gguf ggml-model-i2_s.gguf             --revision "$MODEL_REV" --local-dir "$MODEL_DIR"
+          sha256sum "$MODEL_FILE"
+          ls -lh "$MODEL_FILE"
+
+      - name: Build official bitnet.cpp
+        run: |
+          cd BitNet
+          python3 -m pip install --break-system-packages -r requirements.txt
+          CC=clang-18 CXX=clang++-18 python3 setup_env.py -md "$MODEL_DIR" -q i2_s
+          cp build/bin/llama-cli build/bin/llama-cli.baseline
+          if [ -f build/bin/llama-bench ]; then cp build/bin/llama-bench build/bin/llama-bench.baseline; fi
+
+      - name: Baseline benchmark
+        run: |
+          cd BitNet
+          mkdir -p ../bitnet2b/results
+          python3 utils/e2e_benchmark.py -m "$MODEL_FILE" -n 128 -p 512 -t 2 | tee ../bitnet2b/results/baseline_t2.txt
+          python3 utils/e2e_benchmark.py -m "$MODEL_FILE" -n 128 -p 512 -t 4 | tee ../bitnet2b/results/baseline_t4.txt
+          ./build/bin/llama-cli.baseline -m "$MODEL_FILE" -c 1024 -n 64 -t 2             --temp 0 --seed 123 --no-display-prompt             -p "User: Explain why the sky is blue in two sentences. Assistant:"             > ../bitnet2b/results/baseline_generation.txt 2>&1 || true
+
+      - name: Patch attention exponential to discrete score-gap LUT
+        run: |
+          python3 bitnet2b/patch_logic_softmax.py BitNet
+          grep -n "llf_exp_gap_lut" BitNet/3rdparty/llama.cpp/ggml/src/ggml-cpu/vec.cpp | head
+
+      - name: Rebuild logic-attention binary
+        run: |
+          cd BitNet
+          cmake --build build -j2
+          cp build/bin/llama-cli build/bin/llama-cli.logic
+
+      - name: Logic benchmark
+        run: |
+          cd BitNet
+          python3 utils/e2e_benchmark.py -m "$MODEL_FILE" -n 128 -p 512 -t 2 | tee ../bitnet2b/results/logic_t2.txt
+          python3 utils/e2e_benchmark.py -m "$MODEL_FILE" -n 128 -p 512 -t 4 | tee ../bitnet2b/results/logic_t4.txt
+          ./build/bin/llama-cli.logic -m "$MODEL_FILE" -c 1024 -n 64 -t 2             --temp 0 --seed 123 --no-display-prompt             -p "User: Explain why the sky is blue in two sentences. Assistant:"             > ../bitnet2b/results/logic_generation.txt 2>&1 || true
+
+      - name: Compare deterministic outputs
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          a=Path("bitnet2b/results/baseline_generation.txt").read_text(errors="ignore")
+          b=Path("bitnet2b/results/logic_generation.txt").read_text(errors="ignore")
+          Path("bitnet2b/results/generation_compare.txt").write_text(
+              "exact_file_match=" + str(a==b) + "\n"
+              + "baseline_tail:\n" + a[-4000:] + "\n\nlogic_tail:\n" + b[-4000:]
+          )
+          print("generation exact file match:", a==b)
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bitnet2b-logic-ab-results
+          path: bitnet2b/results/
