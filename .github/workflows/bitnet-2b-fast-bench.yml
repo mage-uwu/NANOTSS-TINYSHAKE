@@ -1,0 +1,83 @@
+name: BitNet 2B Logic A-B Fast Build
+
+on:
+  push:
+    branches: [bitnet-2b-llf-bench]
+    paths:
+      - ".github/workflows/bitnet-2b-fast-bench.yml"
+  workflow_dispatch:
+
+jobs:
+  bench:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      HF_HUB_ENABLE_HF_TRANSFER: "1"
+      MODEL_REV: a1f2f1c765812aa8af3f6eda4a313707064bba15
+      MODEL_DIR: ${{ github.workspace }}/BitNet/models/BitNet-b1.58-2B-4T
+      MODEL_FILE: ${{ github.workspace }}/BitNet/models/BitNet-b1.58-2B-4T/ggml-model-i2_s.gguf
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq cmake ninja-build clang-18 git
+          python3 -m pip install --upgrade --break-system-packages huggingface_hub hf_transfer
+
+      - name: Fetch official BitNet and exact model
+        run: |
+          git clone --recursive --depth 1 https://github.com/microsoft/BitNet.git
+          mkdir -p "$MODEL_DIR"
+          hf download microsoft/bitnet-b1.58-2B-4T-gguf ggml-model-i2_s.gguf             --revision "$MODEL_REV" --local-dir "$MODEL_DIR"
+          sha256sum "$MODEL_FILE"
+          lscpu | tee bitnet2b_machine.txt
+
+      - name: Minimal official build
+        run: |
+          cd BitNet
+          cmake -S . -B build -G Ninja             -DCMAKE_BUILD_TYPE=Release             -DCMAKE_C_COMPILER=clang-18             -DCMAKE_CXX_COMPILER=clang++-18             -DBITNET_X86_TL2=OFF             -DLLAMA_BUILD_TOOLS=ON             -DLLAMA_BUILD_EXAMPLES=ON             -DLLAMA_BUILD_COMMON=ON             -DLLAMA_BUILD_SERVER=OFF
+          cmake --build build --target llama-cli llama-bench -j2
+          cp build/bin/llama-cli build/bin/llama-cli.baseline
+          cp build/bin/llama-bench build/bin/llama-bench.baseline
+
+      - name: Baseline
+        run: |
+          mkdir -p bitnet2b/results_fast
+          BitNet/build/bin/llama-bench.baseline -m "$MODEL_FILE" -p 512 -n 128 -t 2 -r 3             | tee bitnet2b/results_fast/baseline_bench.txt
+          BitNet/build/bin/llama-cli.baseline -m "$MODEL_FILE" -c 1024 -n 48 -t 2             --temp 0 --seed 123 --no-display-prompt             -p "User: Explain why the sky is blue in two sentences. Assistant:"             > bitnet2b/results_fast/baseline_generation.txt 2>&1
+
+      - name: Logic attention patch and rebuild
+        run: |
+          python3 bitnet2b/patch_logic_softmax.py BitNet
+          cd BitNet
+          cmake --build build --target llama-cli llama-bench -j2
+          cp build/bin/llama-cli build/bin/llama-cli.logic
+          cp build/bin/llama-bench build/bin/llama-bench.logic
+
+      - name: Logic A-B
+        run: |
+          BitNet/build/bin/llama-bench.logic -m "$MODEL_FILE" -p 512 -n 128 -t 2 -r 3             | tee bitnet2b/results_fast/logic_bench.txt
+          BitNet/build/bin/llama-cli.logic -m "$MODEL_FILE" -c 1024 -n 48 -t 2             --temp 0 --seed 123 --no-display-prompt             -p "User: Explain why the sky is blue in two sentences. Assistant:"             > bitnet2b/results_fast/logic_generation.txt 2>&1
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          a=Path("bitnet2b/results_fast/baseline_generation.txt").read_text(errors="ignore")
+          b=Path("bitnet2b/results_fast/logic_generation.txt").read_text(errors="ignore")
+          def clean(x):
+              return "\n".join(line for line in x.splitlines()
+                               if not re.search(r"(llama_|load|timings|sampler|build:|main:|system_info)", line))
+          ca,cb=clean(a),clean(b)
+          Path("bitnet2b/results_fast/generation_compare.txt").write_text(
+              "clean_text_match="+str(ca==cb)+"\nBASELINE:\n"+ca[-3000:]+"\nLOGIC:\n"+cb[-3000:]
+          )
+          print("clean deterministic generation match:",ca==cb)
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bitnet2b-logic-ab-fast-results
+          path: |
+            bitnet2b/results_fast/
+            bitnet2b_machine.txt
