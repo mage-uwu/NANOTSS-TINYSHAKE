@@ -31,10 +31,10 @@ jobs:
           git clone --recursive --depth 1 https://github.com/microsoft/BitNet.git
           mkdir -p "$MODEL_DIR"
           hf download microsoft/bitnet-b1.58-2B-4T-gguf ggml-model-i2_s.gguf             --revision "$MODEL_REV" --local-dir "$MODEL_DIR"
-          mkdir -p bitnet2b/results_quick
-          lscpu > bitnet2b/results_quick/machine.txt
-          sha256sum "$MODEL_FILE" > bitnet2b/results_quick/model_sha256.txt
-          (cd BitNet && git rev-parse HEAD && git submodule status) > bitnet2b/results_quick/code_revisions.txt
+          mkdir -p bitnet2b/results_depth
+          lscpu > bitnet2b/results_depth/machine.txt
+          sha256sum "$MODEL_FILE" > bitnet2b/results_depth/model_sha256.txt
+          (cd BitNet && git rev-parse HEAD && git submodule status) > bitnet2b/results_depth/code_revisions.txt
 
       - name: Build exact official baseline
         run: |
@@ -43,9 +43,9 @@ jobs:
           cmake --build build --target llama-bench -j4
           cp build/bin/llama-bench build/bin/llama-bench.baseline
 
-      - name: Baseline benchmark only
+      - name: Baseline long-context decode
         run: |
-          BitNet/build/bin/llama-bench.baseline             -m "$MODEL_FILE" -p 256 -n 64 -t 2 -r 2             | tee bitnet2b/results_quick/baseline.txt
+          BitNet/build/bin/llama-bench.baseline             -m "$MODEL_FILE" -p 1 -n 64 -d 512,2048 -t 2 -r 3             | tee bitnet2b/results_depth/baseline_depth.txt
 
       - name: Compile score-gap logic LUT attention
         run: |
@@ -54,11 +54,11 @@ jobs:
           cmake --build build --target llama-bench -j4
           cp build/bin/llama-bench build/bin/llama-bench.logic
 
-      - name: Logic benchmark only
+      - name: Logic long-context decode
         run: |
-          BitNet/build/bin/llama-bench.logic             -m "$MODEL_FILE" -p 256 -n 64 -t 2 -r 2             | tee bitnet2b/results_quick/logic.txt
+          BitNet/build/bin/llama-bench.logic             -m "$MODEL_FILE" -p 1 -n 64 -d 512,2048 -t 2 -r 3             | tee bitnet2b/results_depth/logic_depth.txt
 
       - uses: actions/upload-artifact@v4
         with:
-          name: bitnet2b-logic-speed-proof
-          path: bitnet2b/results_quick/
+          name: bitnet2b-logic-depth-proof
+          path: bitnet2b/results_depth/
