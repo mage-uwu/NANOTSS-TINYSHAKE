@@ -11,7 +11,7 @@ on:
 jobs:
   bench:
     runs-on: ubuntu-24.04
-    timeout-minutes: 180
+    timeout-minutes: 90
     env:
       HF_HUB_ENABLE_HF_TRANSFER: "1"
       MODEL_REV: a1f2f1c765812aa8af3f6eda4a313707064bba15
@@ -23,79 +23,73 @@ jobs:
 
       - name: Machine
         run: |
-          uname -a
-          lscpu
+          lscpu | tee bitnet2b_machine.txt
           free -h
           df -h
 
       - name: Dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y cmake ninja-build clang-18 python3-pip git git-lfs
-          python3 -m pip install --upgrade --break-system-packages huggingface_hub hf_transfer numpy
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq cmake ninja-build clang-18 git
+          python3 -m pip install --upgrade --break-system-packages huggingface_hub hf_transfer
 
-      - name: Clone official BitNet
+      - name: Fetch official BitNet and exact Microsoft GGUF
         run: |
-          git clone --recursive https://github.com/microsoft/BitNet.git
+          git clone --recursive --depth 1 https://github.com/microsoft/BitNet.git
           cd BitNet
-          git rev-parse HEAD
-          git submodule status
-
-      - name: Download exact Microsoft 2B GGUF
-        run: |
+          git rev-parse HEAD | tee ../bitnet2b_bitnet_commit.txt
+          git submodule status | tee -a ../bitnet2b_bitnet_commit.txt
+          cd ..
           mkdir -p "$MODEL_DIR"
           hf download microsoft/bitnet-b1.58-2B-4T-gguf ggml-model-i2_s.gguf             --revision "$MODEL_REV" --local-dir "$MODEL_DIR"
-          sha256sum "$MODEL_FILE"
-          ls -lh "$MODEL_FILE"
+          sha256sum "$MODEL_FILE" | tee bitnet2b_model_sha.txt
 
-      - name: Build official bitnet.cpp
+      - name: Minimal official build
         run: |
           cd BitNet
-          python3 -m pip install --break-system-packages -r requirements.txt
-          CC=clang-18 CXX=clang++-18 python3 setup_env.py -md "$MODEL_DIR" -q i2_s
+          cmake -S . -B build -G Ninja             -DCMAKE_BUILD_TYPE=Release             -DCMAKE_C_COMPILER=clang-18             -DCMAKE_CXX_COMPILER=clang++-18             -DBITNET_X86_TL2=OFF             -DLLAMA_BUILD_TOOLS=ON             -DLLAMA_BUILD_EXAMPLES=ON             -DLLAMA_BUILD_COMMON=ON             -DLLAMA_BUILD_SERVER=OFF
+          cmake --build build --target llama-cli llama-bench -j2
           cp build/bin/llama-cli build/bin/llama-cli.baseline
-          if [ -f build/bin/llama-bench ]; then cp build/bin/llama-bench build/bin/llama-bench.baseline; fi
+          cp build/bin/llama-bench build/bin/llama-bench.baseline
 
       - name: Baseline benchmark
         run: |
-          cd BitNet
-          mkdir -p ../bitnet2b/results
-          python3 utils/e2e_benchmark.py -m "$MODEL_FILE" -n 128 -p 512 -t 2 | tee ../bitnet2b/results/baseline_t2.txt
-          python3 utils/e2e_benchmark.py -m "$MODEL_FILE" -n 128 -p 512 -t 4 | tee ../bitnet2b/results/baseline_t4.txt
-          ./build/bin/llama-cli.baseline -m "$MODEL_FILE" -c 1024 -n 64 -t 2             --temp 0 --seed 123 --no-display-prompt             -p "User: Explain why the sky is blue in two sentences. Assistant:"             > ../bitnet2b/results/baseline_generation.txt 2>&1 || true
+          mkdir -p bitnet2b/results
+          BitNet/build/bin/llama-bench.baseline -m "$MODEL_FILE" -p 512 -n 128 -t 2 -r 3             | tee bitnet2b/results/baseline_bench.txt
+          BitNet/build/bin/llama-cli.baseline -m "$MODEL_FILE" -c 1024 -n 48 -t 2             --temp 0 --seed 123 --no-display-prompt             -p "User: Explain why the sky is blue in two sentences. Assistant:"             > bitnet2b/results/baseline_generation.txt 2>&1
 
-      - name: Patch attention exponential to discrete score-gap LUT
+      - name: Compile discrete logic attention math
         run: |
           python3 bitnet2b/patch_logic_softmax.py BitNet
-          grep -n "llf_exp_gap_lut" BitNet/3rdparty/llama.cpp/ggml/src/ggml-cpu/vec.cpp | head
-
-      - name: Rebuild logic-attention binary
-        run: |
           cd BitNet
-          cmake --build build -j2
+          cmake --build build --target llama-cli llama-bench -j2
           cp build/bin/llama-cli build/bin/llama-cli.logic
+          cp build/bin/llama-bench build/bin/llama-bench.logic
 
       - name: Logic benchmark
         run: |
-          cd BitNet
-          python3 utils/e2e_benchmark.py -m "$MODEL_FILE" -n 128 -p 512 -t 2 | tee ../bitnet2b/results/logic_t2.txt
-          python3 utils/e2e_benchmark.py -m "$MODEL_FILE" -n 128 -p 512 -t 4 | tee ../bitnet2b/results/logic_t4.txt
-          ./build/bin/llama-cli.logic -m "$MODEL_FILE" -c 1024 -n 64 -t 2             --temp 0 --seed 123 --no-display-prompt             -p "User: Explain why the sky is blue in two sentences. Assistant:"             > ../bitnet2b/results/logic_generation.txt 2>&1 || true
-
-      - name: Compare deterministic outputs
-        run: |
+          BitNet/build/bin/llama-bench.logic -m "$MODEL_FILE" -p 512 -n 128 -t 2 -r 3             | tee bitnet2b/results/logic_bench.txt
+          BitNet/build/bin/llama-cli.logic -m "$MODEL_FILE" -c 1024 -n 48 -t 2             --temp 0 --seed 123 --no-display-prompt             -p "User: Explain why the sky is blue in two sentences. Assistant:"             > bitnet2b/results/logic_generation.txt 2>&1
           python3 - <<'PY'
           from pathlib import Path
+          import re
           a=Path("bitnet2b/results/baseline_generation.txt").read_text(errors="ignore")
           b=Path("bitnet2b/results/logic_generation.txt").read_text(errors="ignore")
+          def clean(x):
+              drop=re.compile(r"(llama_|load|timings|sampler|build:|main:|system_info)")
+              return "\n".join(line for line in x.splitlines() if not drop.search(line))
+          ca,cb=clean(a),clean(b)
           Path("bitnet2b/results/generation_compare.txt").write_text(
-              "exact_file_match=" + str(a==b) + "\n"
-              + "baseline_tail:\n" + a[-4000:] + "\n\nlogic_tail:\n" + b[-4000:]
+              "clean_text_match="+str(ca==cb)+"\nBASELINE:\n"+ca[-3000:]+"\nLOGIC:\n"+cb[-3000:]
           )
-          print("generation exact file match:", a==b)
+          print("clean deterministic generation match:",ca==cb)
           PY
 
       - uses: actions/upload-artifact@v4
         with:
           name: bitnet2b-logic-ab-results
-          path: bitnet2b/results/
+          path: |
+            bitnet2b/results/
+            bitnet2b_machine.txt
+            bitnet2b_bitnet_commit.txt
+            bitnet2b_model_sha.txt
